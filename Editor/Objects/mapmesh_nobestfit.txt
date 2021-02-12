@@ -1,0 +1,400 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.AssetImporters;
+using System.IO;
+using Datamodel;
+using DM = Datamodel.Datamodel;
+using VMAP;
+
+namespace VMAP {
+    //represents a CMapMesh
+    public class CMapMesh : MapObject {
+        public CMapMesh (Element element, VMAPImportContext context) : base(element, context) { }
+
+        public override void Import () {
+            obj.name = "mesh " + element.ID.ToString();
+
+            Element meshData = (Element)element["meshData"];
+            string[] materialStrings;
+
+            Mesh mesh = Process(meshData, context, out materialStrings);
+
+            context.assetContext.AddObjectToAsset(meshData.ID.ToString(), mesh);
+
+            //process material list
+            Material[] materials = new Material[materialStrings.Length];
+            for (int i = 0; i < materials.Length; i++) {
+                string mat = context.materialSearchPath + materialStrings[i].Replace("materials/", null).Replace(".vmat", null) + ".mat";
+                materials[i] = AssetDatabase.LoadAssetAtPath<Material>(mat);
+            }
+
+            MeshFilter f = obj.AddComponent<MeshFilter>();
+            f.sharedMesh = mesh;
+            MeshRenderer r = obj.AddComponent<MeshRenderer>();
+            r.materials = materials;
+            MeshCollider c = obj.AddComponent<MeshCollider>();
+            c.sharedMesh = mesh;
+
+            /*MeshConcaveTest d = obj.AddComponent<MeshConcaveTest>();
+            Plane plane = BestFitPlane(mesh.vertices);
+            d.planeNormal = plane.normal;
+            d.planeDist = plane.distance;
+
+            d.flatverts3D = FlattenToPlane(mesh.vertices, plane);
+            d.flatverts2D = ReorientTo2D(d.flatverts3D.ToArray(), plane, out d.axisX, out d.axisY);*/
+        }
+
+
+        //turn a CDmePolygonMesh element into a Unity Mesh.
+        public static Mesh Process (Element meshData, VMAPImportContext context, out string[] newMaterials) {
+            Mesh m = new Mesh();
+
+            //grab data stream elements for later
+            Element vertexData = (Element)meshData["vertexData"];
+            Element faceVertexData = (Element)meshData["faceVertexData"];
+            Element faceData = (Element)meshData["faceData"];
+
+            //get the edge associated with a vert. (unknown use)
+            Array<int> vertexEdgeIndices = (Array<int>)meshData["vertexEdgeIndices"];
+            //index list of verts
+            Array<int> vertexDataIndices = (Array<int>)meshData["vertexDataIndices"];
+
+            //edgeVertex tells us which two verts an edge is between.
+            Array<int> edgeVertexIndices = (Array<int>)meshData["edgeVertexIndices"];
+            //unknown use
+            Array<int> edgeOppositeIndices = (Array<int>)meshData["edgeOppositeIndices"];
+            //edgeNext tells us that, if we start at vertex edgeVertexIndices[i], the next vertex in that face is edgeVertexIndices[edgeNextIndices[i]].
+            Array<int> edgeNextIndices = (Array<int>)meshData["edgeNextIndices"];
+            //edgeFace tells us which two faces an edge is between. Always corresponds by index to a loop of edges (i.e. when using edgeNextIndices to cycle all verts in a face.)
+            Array<int> edgeFaceIndices = (Array<int>)meshData["edgeFaceIndices"];
+            //get edge associated with edge array index
+            Array<int> edgeDataIndices = (Array<int>)meshData["edgeDataIndices"];
+            //unknown use
+            Array<int> edgeVertexDataIndices = (Array<int>)meshData["edgeVertexDataIndices"];
+            //get an edge array index based on a face index.
+            Array<int> faceEdgeIndices = (Array<int>)meshData["faceEdgeIndices"];
+            //list of all faces. we just grab this to know how many faces to expect.
+            Array<int> faceDataIndices = (Array<int>)meshData["faceDataIndices"];
+
+            //list of all materials.
+            Array<string> materials = (Array<string>)meshData["materials"];
+
+            //mesh data we want to know for each vertex. access with the same index when using edgeVertexIndices to generate each face.
+            Array<System.Numerics.Vector3> position = null;
+            Array<System.Numerics.Vector2> texcoord = null;
+            Array<System.Numerics.Vector3> normal = null;
+            Array<System.Numerics.Vector4> tangent = null;
+
+
+
+
+            //material belonging to each face by materials[i].
+            Array<int> materialIndex = null;
+
+            //loop through data streams to grab additional info
+            foreach (Element datastream in (Array<Element>)vertexData["streams"]) {
+                if (datastream.Name.Equals("position:0"))
+                    position = (Array<System.Numerics.Vector3>)datastream["data"];
+            }
+
+            foreach (Element datastream in (Array<Element>)faceVertexData["streams"]) {
+                if (datastream.Name.Equals("texcoord:0"))
+                    texcoord = (Array<System.Numerics.Vector2>)datastream["data"];
+                if (datastream.Name.Equals("normal:0"))
+                    normal = (Array<System.Numerics.Vector3>)datastream["data"];
+                if (datastream.Name.Equals("tangent:0"))
+                    tangent = (Array<System.Numerics.Vector4>)datastream["data"];
+            }
+
+            foreach (Element datastream in (Array<Element>)faceData["streams"]) {
+                if (datastream.Name.Equals("materialindex:0"))
+                    materialIndex = (Array<int>)datastream["data"];
+            }
+
+            //zDebug.Log(position.Count);
+
+            //we have finally harvested all of our data. now build the mesh
+
+            List<Vector3> newVerts = new List<Vector3>();
+            List<Vector2> newUV = new List<Vector2>();
+            List<Vector3> newNormals = new List<Vector3>();
+            List<Vector4> newTangents = new List<Vector4>();
+
+            //we need one submesh for every material in the mesh. write triangles to the appropriate newTris[i] based on materialIndex.
+            m.subMeshCount = materials.Count;
+            List<int>[] newTris = new List<int>[m.subMeshCount];
+            for (int i = 0; i < m.subMeshCount; i++) { newTris[i] = new List<int>(); }
+
+            //run this loop on every face.
+            foreach (int face in faceDataIndices) {
+                //list of all verts in this face. this is unity index, not DMX index.
+                List<int> vertsInFace = new List<int>();
+                //number of verts in face.
+                int vertCount = 0;
+                foreach (int f in edgeFaceIndices) { if (f == face) vertCount++; }
+                //index of edgevert array to start on. this changes every loop as we circle around the verts of the face.
+                int vertLoopIndex = faceEdgeIndices[face];
+
+                //submesh to write to. each submesh is one material, so write to newTris[] based on materialIndex.
+                int subMesh = materialIndex[face];
+
+                for (int i = 0; i < vertCount; i++) {
+                    int vertIndex = edgeVertexIndices[vertLoopIndex];
+                    int edgeIndex = edgeVertexDataIndices[vertLoopIndex];
+
+                    Vector3 p = new Vector3(-position[vertIndex].Y, position[vertIndex].Z, position[vertIndex].X) * context.scale;
+                    //Vector3 p = new Vector3(position[dataIndex].X, position[dataIndex].Y, position[index].Z) * context.scale;
+                    Vector2 uv = new Vector2(texcoord[edgeIndex].X, texcoord[edgeIndex].Y);
+                    Vector3 n = new Vector3(-normal[edgeIndex].Y, normal[edgeIndex].Z, normal[edgeIndex].X);
+                    //Vector4 t = new Vector4(tangent[index].W, tangent[index].X, tangent[index].Y, tangent[index].Z);
+
+                    newVerts.Add(p);
+                    newUV.Add(uv);
+                    newNormals.Add(n);
+                    //newTangents.Add(t);
+
+                    vertsInFace.Add(newVerts.Count - 1);
+
+                    vertLoopIndex = edgeNextIndices[vertLoopIndex];
+                }
+
+                //we now have all the verts in the face. turn that into triangles.
+
+                bool concave = false;
+
+                if (!concave) {
+                    for (int i = 0; i < vertsInFace.Count - 2; i++) {
+                        newTris[subMesh].Add(vertsInFace[0]);
+                        newTris[subMesh].Add(vertsInFace[i + 2]);
+                        newTris[subMesh].Add(vertsInFace[i + 1]);
+                    }
+                } else {
+                    //get list of verts as points in 3d space, not as indexes.
+                    List<Vector3> v3D = new List<Vector3>();
+                    foreach(int i in vertsInFace) {
+                        v3D.Add(newVerts[i]);
+                    }
+
+                    Plane bestfit = BestFitPlane(v3D.ToArray());
+                    v3D = FlattenToPlane(v3D.ToArray(), bestfit);
+
+
+                    //TO MAKE TRIANGLES:
+                    // LOOP:
+                    //  1) Pick point "x"
+                    //  2) Grab points at x-1 and x+1 to form a triangle
+                    //  3) VERIFY:
+                    //   A) Interior of triangle contains no points from list
+                    //   B) Triangle is inside polygon (Verify that point "x" is a convex angle rather than concave. HOW DO YOU DO THIS??)
+                    //  4) If triangle passes tests, add the triangle to the mesh, and remove "x" from the list.
+                    // END LOOP when list of points has fewer than 3 points, indicating all triangles have been made.
+
+                    //TRIANGLE CHECKING METHOD:
+                    // 1) Define triangle with x, x-1, x+1
+                    // 2) Define plane of triangle, define "x axis" as line from x to x+1 (this is arbitrary tbh), define "y axis" as cross product of "x axis" and plane normal
+                    // 3) Project with x and y axes to get local x,y coords relative to triangle plane
+                    // FOR EACH POINT NOT IN TRIANGLE:
+                    //  A) Project point onto plane
+                    //  B) Project with x and y axes to get "x,y" coords relative to triangle plane
+                    //  C) Perform typical 2D triangle-point intersection check
+
+                    //TODO: Rework v to be a list of structs that track their index so we can track things properly as v gets culled during polygon creation
+
+                    List<Vector2> v = ReorientTo2D(v3D.ToArray(), bestfit);                    
+                    int size = v.Count;
+                    List<int> indexList = new List<int>();
+                    for (int i = 0; i < size; i++) { indexList.Add(i); }
+
+                    bool IsConcave (Vector2 prev, Vector2 current, Vector2 next) {
+                        Vector2 first = current - prev;
+                        Vector2 second = next - current;
+                        float angle = Vector3.SignedAngle(first.normalized, second.normalized, Vector3.forward);
+                        return angle <= 0;   //treat an angle of 0 to be concave, we want to skip it like any other concave angle
+                    }
+
+                    int safeguard = 9999;
+                    int index = 0;
+
+                    //loop through verts
+                    while (safeguard > 0 && v.Count > 2) {
+                        size = v.Count; //recalc size every time, just in case.
+                        index = (index + 1) % size;
+                        safeguard--;
+
+                        //get indices of previous and next verts
+                        int prev = (index == 0) ? size - 1 : index - 1;
+                        int next = (index + 1) % size;
+
+                        //skip concave angles
+                        if (IsConcave(v[prev], v[index], v[next])) continue;
+
+                        //check if triangle is clear
+                        bool triangleClear = true;
+
+                        //if we pass all checks, make triangle and remove current point from list
+                        if (triangleClear) {
+                            newTris[subMesh].Add(vertsInFace[indexList[prev]]);
+                            newTris[subMesh].Add(vertsInFace[indexList[next]]);
+                            newTris[subMesh].Add(vertsInFace[indexList[index]]);
+
+                            v.RemoveAt(index);
+                            indexList.RemoveAt(index);
+                        }
+                    }
+                }
+            }
+
+            m.SetVertices(newVerts);
+            m.SetUVs(0, newUV);
+            m.SetNormals(newNormals);
+            //m.SetTangents(newTangents);
+            //m.RecalculateNormals();
+            m.RecalculateTangents();
+            for (int i = 0; i < newTris.Length; i++) { m.SetTriangles(newTris[i], i); }
+
+            newMaterials = new string[materials.Count];
+            for (int i = 0; i < materials.Count; i++) { newMaterials[i] = materials[i]; }
+
+            return m;
+        }
+
+        //struct for dealing with individual triangles when constructing a mesh. has methods for projecting 
+        struct TrianglePlane {
+            Plane plane;
+            Vector3 axisX, axisY;
+            Vector3 A,   B,   C;
+            Vector2 A2D, B2D, C2D;
+
+            public TrianglePlane (Vector3 A, Vector3 B, Vector3 C) {
+                this.A = A;
+                this.B = B;
+                this.C = C;
+                plane = new Plane(A, B, C);
+
+                axisX = (A - B).normalized;
+                axisY = Vector3.Cross(axisX, plane.normal).normalized;
+
+                A2D = Project(A, axisX, axisY);
+                B2D = Project(B, axisX, axisY);
+                C2D = Project(C, axisX, axisY);
+            }
+
+            //static method to project a point onto the local x,y coord system.
+            public static Vector2 Project (Vector3 v, Vector3 axisX, Vector3 axisY) {
+                Vector3 xv = Vector3.Project(v, axisX);
+                Vector3 yv = Vector3.Project(v, axisY);
+
+                float x = (Vector3.Distance(axisX, xv) - Vector3.Distance(axisX, axisX * xv.magnitude) < 0.5f) ? xv.magnitude : -xv.magnitude;
+                float y = (Vector3.Distance(axisY, yv) - Vector3.Distance(axisY, axisY * yv.magnitude) < 0.5f) ? yv.magnitude : -yv.magnitude;
+
+                return new Vector2(x, y);
+            }
+
+            //static method for projection but with a triangle as input.
+            public static Vector2 Project (Vector3 v, Vector3 A, Vector3 B, Vector3 C) {
+                Plane plane = new Plane(A, B, C);
+
+                Vector3 axisX = (A - B).normalized;
+                Vector3 axisY = Vector3.Cross(axisX, plane.normal).normalized;
+
+                return Project(v, axisX, axisY);
+            }
+
+            //local method for projection.
+            public Vector2 Project (Vector3 v) {
+                return Project(v, axisX, axisY);
+            }
+
+            //thanks for triangle detection
+            //https://stackoverflow.com/questions/2049582/how-to-determine-if-a-point-is-in-a-2d-triangle
+
+            public bool PointIntersect (Vector2 pt) {
+                float d1, d2, d3;
+
+                d1 = sign(pt, A2D, B2D);
+                d2 = sign(pt, B2D, C2D);
+                d3 = sign(pt, C2D, A2D);
+
+                bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+                bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+
+                return !(has_neg && has_pos);
+            }
+
+            public bool PointIntersect (Vector3 pt) {
+                return PointIntersect(Project(pt));
+            }
+
+            float sign (Vector2 p1, Vector2 p2, Vector2 p3) {
+                return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+            }
+        }
+
+        public static Plane BestFitPlane (Vector3[] verts) {
+            //Find best-fit plane for all verts in face
+            //thanks: https://stackoverflow.com/questions/29356594/fitting-a-plane-to-a-set-of-points-using-singular-value-decomposition
+
+            Vector3 centroid = Vector3.zero;
+            foreach (Vector3 v in verts) { centroid += v; }
+            centroid /= verts.Length;
+
+            int size = verts.Length;
+
+            double[,] dataMat = new double[3, size];
+            double[] w = new double[3];
+            double[,] u = new double[3, 3];
+            double[,] vt = new double[size, size];
+
+            for (int i = 0; i < size; i++) {
+                dataMat[0, i] = verts[i].x - centroid.x;
+                dataMat[1, i] = verts[i].y - centroid.y;
+                dataMat[2, i] = verts[i].z - centroid.z;
+            }
+
+            bool a = alglib.svd.rmatrixsvd(dataMat, 3, size, 1, 1, 2, ref w, ref u, ref vt, null);
+
+            Vector3 planeNormal = new Vector3((float)u[0, 2], (float)u[1, 2], (float)u[2, 2]);
+            Plane plane = new Plane(planeNormal, centroid);
+            //Debug.Log(plane);
+            return plane;
+        }
+
+        public static List<Vector3> FlattenToPlane (Vector3[] verts, Plane plane) {
+            for (int i = 0; i < verts.Length; i++) {
+                verts[i] = plane.ClosestPointOnPlane(verts[i]);
+            }
+
+            return new List<Vector3>(verts);
+        }
+
+        public static List<Vector2> ReorientTo2D (Vector3[] verts, Plane plane) { Vector3 x, y; return ReorientTo2D(verts, plane, out x, out y); }
+
+        public static List<Vector2> ReorientTo2D (Vector3[] verts, Plane plane, out Vector3 axisX, out Vector3 axisY) {
+            //our method:
+            //take any vector on the plane and call this the "x axis"
+            //take the cross product of the normal and the "x axis" to get the "y axis"
+            //project both of these axes for each point and measure the magnitude to generate new x,y coordinates for each vert
+
+            //define axes
+            axisX = (verts[0] - verts[1]).normalized;    //this is COMPLETELY arbitrary and could be any vector coplanar to the plane.
+            axisY = Vector3.Cross(axisX, plane.normal).normalized;
+
+            //project to get x,y coords
+            List<Vector2> output = new List<Vector2>();
+            foreach (Vector3 v in verts) {
+                Vector3 xv = Vector3.Project(v, axisX);
+                Vector3 yv = Vector3.Project(v, axisY);
+
+                //if the vector only got longer, use magnitude. if it flipped the opposite direction, use -magnitude.
+                float x = (Vector3.Distance(axisX, xv) - Vector3.Distance(axisX, axisX * xv.magnitude) < 0.5f) ? xv.magnitude : -xv.magnitude;
+                float y = (Vector3.Distance(axisY, yv) - Vector3.Distance(axisY, axisY * yv.magnitude) < 0.5f) ? yv.magnitude : -yv.magnitude;
+
+                output.Add(new Vector2(x, y));
+            }
+
+            return output;
+        }
+    }
+}
