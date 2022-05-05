@@ -1,6 +1,8 @@
 VMAP Importer is a scripted importer for Unity that adds support for .vmap files, which are the format used by Valve's Hammer 2 editor. Simply place a .vmap file into your project's assets folder and it will turn into a prefab that can be added to any scene.
 This importer doesn't quite work "out of the box" and some setup is required.
 
+THIS IS A WORK IN PROGRESS THAT I MIGHT NOT FINISH. I FORGET WHAT STATE I LEFT IT IN AND IT MIGHT NOT BE FUNCTIONAL WITHOUT SOME FIXING.
+
 ## INSTALLATION
 
 Install this package by importing it.
